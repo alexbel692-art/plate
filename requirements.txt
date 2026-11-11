@@ -1,0 +1,5 @@
+fast-alpr[onnx]
+openpyxl
+PySide6-Essentials
+pyinstaller
+pillow

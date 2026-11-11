@@ -1,0 +1,72 @@
+name: Сборка установщика
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Версия
+        shell: bash
+        run: echo "VER=1.0.${{ github.run_number }}" >> $GITHUB_ENV
+
+      - name: Зависимости
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Модели, значок, версия
+        run: |
+          python tools/fetch_models.py
+          python tools/make_icon.py
+          python tools/make_version.py ${{ env.VER }}
+
+      - name: Проверка исходников
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          python run.py --selftest
+          python run.py --uitest
+
+      - name: PyInstaller
+        run: pyinstaller --noconfirm --clean PlateReader.spec
+
+      - name: Проверка собранной программы
+        shell: pwsh
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          $p = Start-Process dist\PlateReader\PlateReader.exe -ArgumentList '--selftest' -Wait -PassThru -NoNewWindow
+          if ($p.ExitCode -ne 0) { throw "selftest exe failed: $($p.ExitCode)" }
+          $p = Start-Process dist\PlateReader\PlateReader.exe -ArgumentList '--uitest' -Wait -PassThru -NoNewWindow
+          if ($p.ExitCode -ne 0) { throw "uitest exe failed: $($p.ExitCode)" }
+
+      - name: Inno Setup
+        run: |
+          choco install innosetup -y --no-progress
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /DAppVersion=${{ env.VER }} installer.iss
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PlateReader-Setup-${{ env.VER }}
+          path: dist/PlateReader-Setup-*.exe
+
+      - name: Релиз
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ env.VER }}
+          name: PlateReader ${{ env.VER }}
+          files: dist/PlateReader-Setup-*.exe
