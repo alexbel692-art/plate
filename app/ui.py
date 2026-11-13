@@ -271,12 +271,27 @@ class SettingsDialog(QDialog):
         self.gap.setValue(float(rec["car_gap_sec"]))
         self.debug = QCheckBox("Сохранять каждое прочтение в папку «отладка» (2 дня)")
         self.debug.setChecked(rec["debug"])
+        self.unrec = QCheckBox("Записывать машины с нераспознанным номером (снимок + «не распознан»)")
+        self.unrec.setChecked(rec.get("record_unrecognized", True))
+        self.motion = QCheckBox("Замечать машину по движению, даже если номер не виден")
+        self.motion.setChecked(rec.get("motion_detect", True))
+        self.motion_pct = QSpinBox()
+        self.motion_pct.setRange(1, 60)
+        self.motion_pct.setSuffix(" % области")
+        self.motion_pct.setValue(int(rec.get("motion_percent", 8)))
+        self.motion_pct.setToolTip("Какая часть области распознавания должна двигаться, "
+                                   "чтобы считать это машиной. Больше — меньше ложных записей.")
+        self.unrec.toggled.connect(self.motion.setEnabled)
+        self.motion.setEnabled(self.unrec.isChecked())
         f.addRow("Модель:", self.quality)
         f.addRow("", self.only_ru)
         f.addRow("Минимальная уверенность прочтения:", self.min_conf)
         f.addRow("Записывать по одному прочтению от:", self.single)
         f.addRow("Не повторять тот же номер в течение:", self.repeat)
         f.addRow("Машина уехала, если номера нет:", self.gap)
+        f.addRow("", self.unrec)
+        f.addRow("", self.motion)
+        f.addRow("Машина — если движется не меньше:", self.motion_pct)
         f.addRow("", self.debug)
         roi_lbl = QLabel("Область распознавания выделяется в главном окне: "
                          "меню «Настройки» → «Область распознавания».")
@@ -378,7 +393,8 @@ class SettingsDialog(QDialog):
             min_confidence=self.min_conf.value() / 100,
             accept_single_confidence=self.single.value() / 100,
             repeat_timeout_sec=self.repeat.value(), car_gap_sec=self.gap.value(),
-            debug=self.debug.isChecked())
+            debug=self.debug.isChecked(), record_unrecognized=self.unrec.isChecked(),
+            motion_detect=self.motion.isChecked(), motion_percent=self.motion_pct.value())
         s["output"].update(excel_file=self.excel.text().strip(),
                            save_snapshots=self.save_snaps.isChecked(),
                            snapshot_dir=self.snaps.text().strip())
@@ -464,15 +480,15 @@ class MainWindow(QMainWindow):
         self.count_lbl = QLabel("Проездов сегодня: 0")
         self.count_lbl.setStyleSheet("font-size:15px; font-weight:bold;")
         rl.addWidget(self.count_lbl)
-        self.table = QTableWidget(0, 4)
-        self.table.setHorizontalHeaderLabels(["Дата", "Время", "Номер", "Увер."])
+        self.table = QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels(["Дата", "Время", "Номер", "Увер.", "Примечание"])
         self.table.verticalHeader().setVisible(False)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SingleSelection)
         hh = self.table.horizontalHeader()
         hh.setSectionResizeMode(QHeaderView.ResizeToContents)
-        hh.setSectionResizeMode(2, QHeaderView.Stretch)
+        hh.setSectionResizeMode(4, QHeaderView.Stretch)
         self.table.itemSelectionChanged.connect(self._show_snap)
         self.table.cellDoubleClicked.connect(self._open_snap)
         rl.addWidget(self.table, 3)
@@ -631,12 +647,19 @@ class MainWindow(QMainWindow):
             conf_s = f"{float(conf):.0%}"
         except Exception:
             conf_s = str(conf or "")
-        vals = [d["date"], d["time"], d["plate"], conf_s]
+        if conf in (None, ""):
+            conf_s = ""
+        vals = [d["date"], d["time"], d["plate"], conf_s, d.get("note", "") or ""]
+        unrec = d["plate"] == "не распознан"
         for c, v in enumerate(vals):
-            it = QTableWidgetItem(v)
+            it = QTableWidgetItem(str(v))
             if c == 2:
                 it.setFont(QFont("Arial", 11, QFont.Bold))
                 it.setData(Qt.UserRole, d.get("snap", ""))
+            if unrec:
+                it.setForeground(QColor("#b00020"))
+            if c == 4:
+                it.setToolTip(str(v))
             self.table.setItem(row, c, it)
         if self.table.rowCount() > 500:
             self.table.removeRow(self.table.rowCount() - 1)

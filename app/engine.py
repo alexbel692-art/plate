@@ -30,8 +30,8 @@ TEMPLATE = "LDDDLLDD"
 RU_PLATE = re.compile(r"^[АВЕКМНОРСТУХ]\d{3}[АВЕКМНОРСТУХ]{2}\d{2,3}$")
 
 MODELS = {
-    "accurate": ("yolo-v9-t-640-license-plate-end2end", "cct-s-v1-global-model"),
-    "fast": ("yolo-v9-t-384-license-plate-end2end", "cct-xs-v1-global-model"),
+    "accurate": ("yolo-v9-t-640-license-plate-end2end", "cct-s-v2-global-model"),
+    "fast": ("yolo-v9-t-384-license-plate-end2end", "cct-xs-v2-global-model"),
 }
 
 
@@ -143,13 +143,44 @@ class Recognizer:
         if r is None or not r.text:
             return None
         chars = r.confidence if isinstance(r.confidence, list) else [float(r.confidence)]
-        raw = r.text.replace("_", "")
+        raw = re.sub(r"[^A-Z0-9]", "", r.text.upper())
         if not raw:
             return None
         if len(chars) > len(raw):
             chars = chars[:len(raw)]
         conf = float(sum(chars) / len(chars)) if chars else 0.0
         return raw, chars, conf
+
+    def read_crop(self, crop):
+        """Читает номер целиком и по частям (основная часть + регион отдельно,
+        с несколькими вариантами границы). По частям нужно для 3-значных регионов
+        (750, 790, 797…): целиком модель часто обрезает регион до двух цифр.
+        Из вариантов, подходящих под формат РФ, берётся самый уверенный."""
+        cands = []
+        whole = self._ocr(crop)
+        if whole:
+            cands.append(whole)
+        if self.only_ru:
+            h, w = crop.shape[:2]
+            mains = [self._ocr(crop[:, :int(w * k)]) for k in (0.74, 0.79, 0.84)]
+            regs = [self._ocr(crop[:int(h * 0.80), int(w * k):]) for k in (0.68, 0.73, 0.78)]
+            mains = [m for m in mains if m and len(m[0]) == 6]
+            for m in mains:
+                for g in regs:
+                    if not g:
+                        continue
+                    digits = [(c, p) for c, p in zip(g[0], g[1]) if c.isdigit()][:3]
+                    if len(digits) >= 2:
+                        chars = list(m[1][:6]) + [p for _, p in digits]
+                        cands.append((m[0] + "".join(c for c, _ in digits), chars,
+                                      float(sum(chars) / len(chars))))
+        best = None
+        for raw, chars, conf in cands:
+            fixed = fix_ru(raw) if self.only_ru else plain(raw)
+            key = (fixed is not None, conf)
+            if best is None or key > best[0]:
+                best = (key, (raw, chars, conf, fixed))
+        return best[1] if best else None
 
     def read(self, frame):
         ox = oy = 0
@@ -173,17 +204,48 @@ class Recognizer:
             x1, y1 = max(b.x1 - px, 0), max(b.y1 - py, 0)
             x2, y2 = min(b.x2 + px, W), min(b.y2 + py, H)
             crop = work[y1:y2, x1:x2]
-            best = self._ocr(crop)
+            best = self.read_crop(crop)
             if best is None:
                 continue
-            raw, chars, conf = best
-            fixed = fix_ru(raw) if self.only_ru else plain(raw)
+            raw, chars, conf, fixed = best
             reads.append({
                 "raw": raw, "lat": fixed[0] if fixed else None,
                 "text": fixed[1] if fixed else None, "conf": conf, "chars": chars,
                 "box": (x1 + ox, y1 + oy, x2 + ox, y2 + oy), "w": bw, "crop": crop,
             })
         return reads
+
+
+# ---------------------------------------------------------------- движение
+class MotionDetector:
+    """Доля движущихся пикселей в области распознавания (для машин без номера)."""
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.bg = cv2.createBackgroundSubtractorMOG2(history=150, varThreshold=32,
+                                                     detectShadows=True)
+        self.kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        self.n = 0
+
+    def update(self, frame, roi=None):
+        work = frame
+        if roi:
+            x1, y1, x2, y2 = roi
+            if x2 - x1 > 20 and y2 - y1 > 20:
+                work = frame[y1:y2, x1:x2]
+        h, w = work.shape[:2]
+        s = 320.0 / max(w, 1)
+        small = cv2.resize(work, (320, max(1, int(h * s))), interpolation=cv2.INTER_AREA)
+        small = cv2.GaussianBlur(small, (5, 5), 0)   # цветное: тёмная машина на тёмном асфальте
+        fg = self.bg.apply(small)
+        self.n += 1
+        if self.n < 15:          # фон ещё не выучен
+            return 0.0
+        fg = (fg > 200).astype(np.uint8)       # без теней
+        fg = cv2.morphologyEx(fg, cv2.MORPH_OPEN, self.kernel)
+        return float(fg.mean())
 
 
 # ---------------------------------------------------------------- камера
@@ -269,7 +331,7 @@ def grab_frame(url, tries=2):
 
 # ---------------------------------------------------------------- Excel
 class ExcelLog:
-    HEADER = ["Дата", "Время", "Номер", "Уверенность", "Прочтений", "Снимок"]
+    HEADER = ["Дата", "Время", "Номер", "Уверенность", "Прочтений", "Снимок", "Примечание"]
 
     def __init__(self, path):
         self.path = path
@@ -283,7 +345,7 @@ class ExcelLog:
             ws.append(self.HEADER)
             for c in ws[1]:
                 c.font = Font(bold=True)
-            for col, w in zip("ABCDEF", (12, 10, 14, 13, 11, 60)):
+            for col, w in zip("ABCDEFG", (12, 10, 14, 13, 11, 60, 40)):
                 ws.column_dimensions[col].width = w
             ws.freeze_panes = "A2"
             wb.save(path)
@@ -303,9 +365,12 @@ class ExcelLog:
                 if ws.cell(1, 5).value == "Снимок":
                     ws.insert_cols(5)
                     ws.cell(1, 5, "Прочтений").font = Font(bold=True)
+                if ws.cell(1, 7).value != "Примечание":
+                    ws.cell(1, 7, "Примечание").font = Font(bold=True)
+                    ws.column_dimensions["G"].width = 40
                 for r in self.pending:
                     ws.append(r)
-                ws.auto_filter.ref = f"A1:F{ws.max_row}"
+                ws.auto_filter.ref = f"A1:G{ws.max_row}"
                 wb.save(self.path)
                 self.pending.clear()
                 return True
@@ -323,12 +388,12 @@ class ExcelLog:
             wb.close()
             out = []
             for r in rows[-n:]:
-                r = list(r) + [None] * 6
+                r = list(r) + [None] * 7
                 if isinstance(r[4], str) and (":" in r[4] or "\\" in r[4]) and not r[5]:
                     r[5], r[4] = r[4], ""
                 out.append({"date": str(r[0] or ""), "time": str(r[1] or ""),
                             "plate": str(r[2] or ""), "conf": r[3], "agree": r[4] or "",
-                            "snap": r[5] or ""})
+                            "snap": r[5] or "", "note": r[6] or ""})
             return out
         except Exception:
             return []
@@ -402,6 +467,13 @@ class Engine:
         single = rec_s.get("accept_single_confidence", 0.85)
         gap, max_car = rec_s.get("car_gap_sec", 1.5), rec_s.get("max_car_sec", 8)
         repeat = rec_s.get("repeat_timeout_sec", 120)
+        rec_unrec = rec_s.get("record_unrecognized", True)
+        use_motion = rec_s.get("motion_detect", True)
+        motion_thr = rec_s.get("motion_percent", 8) / 100.0
+        unrec_gap = rec_s.get("unrecognized_gap_sec", 20)
+        motion = MotionDetector() if (rec_unrec and use_motion) else None
+        mv = {"active": False, "start": 0.0, "last": 0.0, "peak": 0.0, "frame": None}
+        marks = {"plate_seen": 0.0, "unrec": 0.0}
 
         last_seen, car, best = {}, [], {"w": 0, "frame": None}
         car_start = car_last = 0.0
@@ -409,21 +481,48 @@ class Engine:
         last_flush = 0.0
         log(f"Распознавание запущено, область {rec_s.get('roi') or 'весь кадр'}")
 
+        def record_unrecognized(frame, note, since=None):
+            if not rec_unrec:
+                return
+            # по номеру без движения (табличка, стоящая машина) — не пишем
+            if since is not None and motion is not None and mv["last"] < since - 1:
+                log(f"  без движения в кадре — не записываю ({note})")
+                return
+            now_t = time.time()
+            if now_t - marks["unrec"] < unrec_gap:
+                return
+            marks["unrec"] = now_t
+            now = datetime.now()
+            snap = ""
+            if snap_dir and frame is not None:
+                snap = os.path.join(snap_dir, f"{now:%Y%m%d_%H%M%S}_не_распознан.jpg")
+                save_jpg(snap, frame)
+            self.xl.add([now.strftime("%d.%m.%Y"), now.strftime("%H:%M:%S"), "не распознан",
+                         None, None, snap, note])
+            st["saved"] += 1
+            log(f"ЗАПИСАН без номера: {note}")
+            self.on_pass({"date": now.strftime("%d.%m.%Y"), "time": now.strftime("%H:%M:%S"),
+                          "plate": "не распознан", "conf": None, "agree": "",
+                          "snap": snap, "note": note})
+
         def finish_car():
             nonlocal car
             reads, frame = car, best["frame"]
             car = []
             best["w"], best["frame"] = 0, None
-            res = vote(reads)
+            res = vote([r for r in reads if r["conf"] >= min_conf])
             if not res:
+                guess = vote(reads)
                 log(f"машина: номер не прочитан ({len(reads)} попыток: "
                     f"{', '.join(sorted({r['raw'] for r in reads}))[:100]})")
+                record_unrecognized(frame, "номер не прочитан"
+                                    + (f", похоже на {guess[0]}" if guess else ""), car_start)
                 return
             plate, conf, agree, n = res
-            if not (agree >= 2 or conf >= single):
+            if not (agree >= 2 or conf >= single) or (
+                    rec_s.get("only_ru", True) and not RU_PLATE.match(plate)):
                 log(f"машина: {plate} — не уверен ({conf:.0%}, совпадений {agree}/{n})")
-                return
-            if rec_s.get("only_ru", True) and not RU_PLATE.match(plate):
+                record_unrecognized(frame, f"не уверен, похоже на {plate} ({conf:.0%})", car_start)
                 return
             now = datetime.now()
             prev = last_seen.get(plate)
@@ -436,7 +535,7 @@ class Engine:
                 snap = os.path.join(snap_dir, f"{now:%Y%m%d_%H%M%S}_{plate}.jpg")
                 save_jpg(snap, frame)
             self.xl.add([now.strftime("%d.%m.%Y"), now.strftime("%H:%M:%S"), plate,
-                         round(conf, 2), f"{agree}/{n}", snap])
+                         round(conf, 2), f"{agree}/{n}", snap, ""])
             self.passes_today += 1
             st["saved"] += 1
             log(f"ЗАПИСАН {plate} ({conf:.0%}, совпадений {agree}/{n})")
@@ -478,6 +577,24 @@ class Engine:
             last_seq = seq
             frames += 1
             st["frames"] += 1
+            if motion is not None:
+                frac = motion.update(frame, rec_s.get("roi"))
+                if frac > motion_thr:
+                    if not mv["active"]:
+                        mv.update(active=True, start=now, peak=0.0, frame=None)
+                    mv["last"] = now
+                    if frac > mv["peak"]:
+                        mv["peak"], mv["frame"] = frac, frame.copy()
+                elif mv["active"] and now - mv["last"] > 2.0:
+                    mv["active"] = False
+                    dur = mv["last"] - mv["start"]
+                    plate_near = marks["plate_seen"] >= mv["start"] - 2
+                    if dur > 40:
+                        motion.reset()          # смена освещения / стоящая машина
+                    elif dur >= 0.8 and not plate_near and not car:
+                        record_unrecognized(mv["frame"], "номер не найден в кадре "
+                                            "(машина по движению)")
+                    mv["frame"] = None
             try:
                 reads = self.rec.read(frame)
             except Exception as e:
@@ -492,17 +609,15 @@ class Engine:
                     name = f"{datetime.now():%Y%m%d_%H%M%S_%f}"[:-3] + \
                            f"_{r['lat'] or 'X' + r['raw']}_{int(r['conf'] * 100)}.jpg"
                     save_jpg(os.path.join(debug_dir, name), r["crop"], 95)
-            useful = [r for r in reads if r["conf"] >= min_conf]
-            if not useful:
-                return
+            marks["plate_seen"] = now
             if not car:
                 car_start = now
             car_last = now
-            car.extend(useful)
-            w = max(r["w"] for r in useful)
+            car.extend(reads)
+            w = max(r["w"] for r in reads)
             if w >= best["w"]:
                 best["w"], best["frame"] = w, frame.copy()
-                for r in useful:
+                for r in reads:
                     x1, y1, x2, y2 = r["box"]
                     cv2.rectangle(best["frame"], (x1, y1), (x2, y2), (0, 255, 0), 2)
 

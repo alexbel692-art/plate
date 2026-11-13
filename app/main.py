@@ -38,6 +38,8 @@ def uitest():
     assert r.canvas.roi() is not None
     w._on_pass({"date": "01.01.2026", "time": "12:00:00", "plate": "А123ВС77",
                 "conf": 0.93, "agree": "2/2", "snap": ""})
+    w._on_pass({"date": "01.01.2026", "time": "12:01:00", "plate": "не распознан",
+                "conf": None, "agree": "", "snap": "", "note": "номер не найден в кадре"})
     w.video.show_frame(frame, [100, 100, 900, 600], [(10, 10, 100, 40, "А123ВС77", 0)])
     app.processEvents()
     print("UITEST OK")
