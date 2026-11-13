@@ -505,6 +505,10 @@ class MainWindow(QMainWindow):
         self.timer.timeout.connect(self._tick)
         self.timer.start(150)
 
+        self.watchdog = QTimer(self)
+        self.watchdog.timeout.connect(self._watchdog)
+        self.watchdog.start(30000)
+
         self._load_history()
         self._apply_autostart()
         if first_run:
@@ -582,6 +586,25 @@ class MainWindow(QMainWindow):
             self.video.show_frame(frame, self.s["recognition"].get("roi"), boxes)
         self.statusBar().showMessage(
             f"Обработка: {eng.fps:.1f} кадр/с   •   Журнал: {self.s['output']['excel_file']}")
+
+    def _watchdog(self):
+        """Если распознавание зависло или камера давно молчит — перезапуск."""
+        eng = self.engine
+        if not eng or not eng.running:
+            return
+        now = time.time()
+        reason = ""
+        if eng.thread and not eng.thread.is_alive():
+            reason = "поток распознавания остановился"
+        elif eng.alive_ts and now - eng.alive_ts > 90:
+            reason = f"распознавание не отвечает {now - eng.alive_ts:.0f} с"
+        elif eng.cam and eng.cam.ts and now - eng.cam.ts > 180:
+            reason = f"нет кадров с камеры {now - eng.cam.ts:.0f} с"
+        if reason:
+            log(f"Сторож: {reason} — перезапускаю распознавание")
+            self.engine = None
+            threading.Thread(target=eng.stop, daemon=True).start()
+            self.start()
 
     def _on_status(self, text, ok):
         color = "#0a7f2e" if ok else "#b00020"

@@ -138,6 +138,19 @@ class Recognizer:
         self.roi = roi
         self.alpr = ALPR(detector_model=det, detector_conf_thresh=0.3, ocr_model=ocr)
 
+    def _ocr(self, img):
+        r = self.alpr.ocr.predict(img)
+        if r is None or not r.text:
+            return None
+        chars = r.confidence if isinstance(r.confidence, list) else [float(r.confidence)]
+        raw = r.text.replace("_", "")
+        if not raw:
+            return None
+        if len(chars) > len(raw):
+            chars = chars[:len(raw)]
+        conf = float(sum(chars) / len(chars)) if chars else 0.0
+        return raw, chars, conf
+
     def read(self, frame):
         ox = oy = 0
         work = frame
@@ -160,14 +173,10 @@ class Recognizer:
             x1, y1 = max(b.x1 - px, 0), max(b.y1 - py, 0)
             x2, y2 = min(b.x2 + px, W), min(b.y2 + py, H)
             crop = work[y1:y2, x1:x2]
-            r = self.alpr.ocr.predict(crop)
-            if r is None or not r.text:
+            best = self._ocr(crop)
+            if best is None:
                 continue
-            chars = r.confidence if isinstance(r.confidence, list) else [float(r.confidence)]
-            raw = r.text.replace("_", "")
-            if len(chars) > len(raw):
-                chars = chars[:len(raw)]
-            conf = float(sum(chars) / len(chars)) if chars else 0.0
+            raw, chars, conf = best
             fixed = fix_ru(raw) if self.only_ru else plain(raw)
             reads.append({
                 "raw": raw, "lat": fixed[0] if fixed else None,
@@ -342,6 +351,7 @@ class Engine:
         self.boxes = []          # [(x1,y1,x2,y2,text,ts)] для подсветки на видео
         self.fps = 0.0
         self.passes_today = 0
+        self.alive_ts = 0.0
 
     # -- управление
     def start(self):
@@ -428,15 +438,25 @@ class Engine:
             self.xl.add([now.strftime("%d.%m.%Y"), now.strftime("%H:%M:%S"), plate,
                          round(conf, 2), f"{agree}/{n}", snap])
             self.passes_today += 1
+            st["saved"] += 1
             log(f"ЗАПИСАН {plate} ({conf:.0%}, совпадений {agree}/{n})")
             self.on_pass({"date": now.strftime("%d.%m.%Y"), "time": now.strftime("%H:%M:%S"),
                           "plate": plate, "conf": round(conf, 2), "agree": f"{agree}/{n}",
                           "snap": snap})
 
         status_ok = None
-        while not self._stop.is_set():
-            self._stop.wait(0.05)
+        st = {"frames": 0, "plates": 0, "saved": 0, "beat": time.time(), "err_ts": 0.0}
+
+        def step():
+            nonlocal status_ok, last_seq, frames, tick, last_flush, car_start, car_last, car
             now = time.time()
+            self.alive_ts = now
+            if now - st["beat"] >= 600:
+                cam_age = now - self.cam.ts if self.cam.ts else -1
+                log(f"работаю: за 10 мин кадров {st['frames']}, кадров с номером {st['plates']}, "
+                    f"записано {st['saved']}; камера: "
+                    + ("ок" if 0 <= cam_age < 10 else f"нет кадров {cam_age:.0f} с"))
+                st.update(frames=0, plates=0, saved=0, beat=now)
             if self.xl.pending and now - last_flush > 5:
                 last_flush = now
                 self.xl.flush()
@@ -454,17 +474,19 @@ class Engine:
                 self.on_status("Камера подключена, идёт распознавание" if ok
                                else "Нет изображения с камеры — переподключаюсь…", bool(ok))
             if frame is None or seq == last_seq:
-                continue
+                return
             last_seq = seq
             frames += 1
+            st["frames"] += 1
             try:
                 reads = self.rec.read(frame)
             except Exception as e:
                 log(f"Ошибка распознавания: {e}")
-                continue
+                return
             self.boxes = [(*r["box"], r["text"] or r["raw"], now) for r in reads]
             if not reads:
-                continue
+                return
+            st["plates"] += 1
             if debug_dir:
                 for r in reads:
                     name = f"{datetime.now():%Y%m%d_%H%M%S_%f}"[:-3] + \
@@ -472,7 +494,7 @@ class Engine:
                     save_jpg(os.path.join(debug_dir, name), r["crop"], 95)
             useful = [r for r in reads if r["conf"] >= min_conf]
             if not useful:
-                continue
+                return
             if not car:
                 car_start = now
             car_last = now
@@ -483,6 +505,18 @@ class Engine:
                 for r in useful:
                     x1, y1, x2, y2 = r["box"]
                     cv2.rectangle(best["frame"], (x1, y1), (x2, y2), (0, 255, 0), 2)
+
+        while not self._stop.is_set():
+            self._stop.wait(0.05)
+            try:
+                step()
+            except Exception:
+                car = []
+                best["w"], best["frame"] = 0, None
+                if time.time() - st["err_ts"] > 60:
+                    st["err_ts"] = time.time()
+                    log("Ошибка в цикле распознавания (продолжаю работу):\n"
+                        + traceback.format_exc())
         if car:
             finish_car()
         if self.xl:
